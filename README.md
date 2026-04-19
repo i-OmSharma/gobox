@@ -7,3 +7,12 @@ Usig Linux premitives
 * NameSpaces
 * cgroups
 * OverlayFS
+
+###  gobox can perform this:
+
+*  create
+* run 
+* ps
+* delete
+* pull
+* push
