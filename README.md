@@ -10,7 +10,7 @@ Usig Linux premitives
 
 ###  gobox can perform this:
 
-*  create
+* create
 * run 
 * ps
 * delete
