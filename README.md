@@ -1,4 +1,4 @@
-# gobox : Container Runtime GO
+# veil : Container Runtime GO
 
 Custom container runtime build in complete Golang. 
 
@@ -8,7 +8,7 @@ Usig Linux premitives
 * cgroups
 * OverlayFS
 
-###  gobox can perform this:
+###  veil can perform this:
 
 * create
 * run 
@@ -20,14 +20,15 @@ Usig Linux premitives
 ## Project Structure
 
 ```
-  gobox
+  veil
     ├── cmd
-    │   └── gobox
+    │   └── veil
     │       └── main.go
-    ├── gobox
+    ├── veil
     ├── go.mod
     ├── internal
     │   ├── cgroup
+    |   |     └──cgroup.go
     │   ├── container
     │   │   └── container.go 
     │   ├── image
