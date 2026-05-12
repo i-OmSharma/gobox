@@ -1,4 +1,19 @@
-
+// Package cgroup manages cgroups v2 resource limits for container processes.
+//
+// It creates a named cgroup slice under /sys/fs/cgroup, delegates the memory
+// and cpu controllers from the parent, writes the requested limits, and moves
+// the container process into the cgroup. On container exit, Remove() deletes
+// the cgroup directory.
+//
+// cgroups v2 hierarchy used by veil:
+//
+//	/sys/fs/cgroup/          ← root cgroup (controllers delegated here)
+//	└── veil-<pid>/          ← per-container cgroup created by Apply()
+//	    ├── memory.max       ← hard RAM limit
+//	    ├── memory.swap.max  ← swap cap (set to 0 to make memory.max enforceable)
+//	    ├── cpu.max          ← "quota period" throttle
+//	    ├── memory.oom_group ← kill whole cgroup on OOM (best-effort)
+//	    └── cgroup.procs     ← container PID written here to attach it
 package cgroup
 
 import (
@@ -10,161 +25,121 @@ import (
 
 const cgroupRoot = "/sys/fs/cgroup"
 
+// CgroupConfig describes the resource limits for a single container's cgroup.
+// Zero values mean "no limit" — Apply() skips writing that controller file.
 type CgroupConfig struct {
 	ID        string
-	MemoryMax int64 //in byte
-	CPUQuota  int64 //in microseconds
-	CPUPeriod int64 //in microseconds
+	MemoryMax int64 // Hard RAM limit in bytes.
+	CPUQuota  int64 // CPU time allowed per period, in microseconds.
+	CPUPeriod int64 // Scheduling window length in microseconds (default 100ms = 100000).
 }
 
-// path returns the full path to the cgroup directory
-func (c *CgroupConfig) path() string { // we have taken Pointers here using pointer receiver (*CgroupConfig) to avoid copying the struct on every call.
+// path returns the absolute path to this cgroup's directory.
+func (c *CgroupConfig) path() string {
 	return filepath.Join(cgroupRoot, c.ID)
 }
-//Actually, path() doesn't modify the struct, so a value receiver func (c CgroupConfig) path() is also fine and slightly more efficient for small structs. 
-// However, keeping it as a pointer receiver is standard practice if other methods (like Apply) modify state or if you want consistency. Just note that path() itself is read-only.
 
-// Apply sets up the cgroup and moves the process into it
+// Apply creates the cgroup, enables controllers, writes limits, and attaches pid.
+// Must be called while the container process is SIGSTOP'd — this ensures no
+// child processes escape the cgroup before limits are in effect.
 func (c *CgroupConfig) Apply(pid int) error {
 	cgPath := c.path()
-	
 
-	// Create cgroup Dir
 	if err := os.MkdirAll(cgPath, 0755); err != nil {
-		return fmt.Errorf("mkdir error: %w", err)
+		return fmt.Errorf("mkdir cgroup: %w", err)
 	}
 
-	//Enable controllers in the parent cgroup
-	// In cgroups v2, controllers must be explicitly enabled in the parent's
-	// cgroup.subtree_control file before they can be used in child cgroups.
+	// cgroups v2: controllers must be listed in the parent's cgroup.subtree_control
+	// before any child cgroup can use them. This is the delegation step.
 	if err := enableControllers(cgroupRoot, "memory", "cpu"); err != nil {
-		return fmt.Errorf("Enable controller: %w", err)
+		return fmt.Errorf("enable controllers: %w", err)
 	}
-
-	// TODO 1: memory.max
-	// Set the hard memory limit. "max" means no limit, otherwise specify bytes.
-	// memFile := filepath.Join(cgPath, "memory.max")
 
 	if c.MemoryMax > 0 {
+		// memory.max: hard RAM limit — processes exceeding this are OOM-killed.
 		if err := write(cgPath, "memory.max", fmt.Sprintf("%d", c.MemoryMax)); err != nil {
-			return fmt.Errorf("Set memory.max: %w", err)
+			return fmt.Errorf("memory.max: %w", err)
+		}
+		// memory.swap.max = 0: disable swap for this cgroup.
+		// Without this, the kernel lets the cgroup overflow into swap and
+		// memory.max becomes ineffective on systems that have swap enabled.
+		if err := write(cgPath, "memory.swap.max", "0"); err != nil {
+			fmt.Printf("[cgroup] warning: could not disable swap: %v\n", err)
 		}
 	}
-
-	// TODO 2: cpu.max
-	// Format: "quota period".
-	// quota: how much CPU time (in microseconds) the group can use within a period.
-	// period: the length of the window (in microseconds).
-	// Example: "50000 100000" means 50% CPU usage.
 
 	if c.CPUQuota > 0 && c.CPUPeriod > 0 {
-		val := fmt.Sprintf("%d %d", c.CPUQuota, c.CPUPeriod)
-		if err := write(cgPath, "cpu.max", val); err != nil {
-			return fmt.Errorf("Set cpu.max: %w", err)
+		// cpu.max format: "quota period"
+		// Example: "25000 100000" = 25% of one CPU core.
+		if err := write(cgPath, "cpu.max", fmt.Sprintf("%d %d", c.CPUQuota, c.CPUPeriod)); err != nil {
+			return fmt.Errorf("cpu.max: %w", err)
 		}
 	}
 
-	// TODO 3: Set OOM Group (NON-CRITICAL / BEST EFFORT)
-	// Docker does this: It tries to set it, but if it fails (permissions/old kernel),
-	// it logs a warning and keeps going. The container still runs, just without 
-	// the "kill-all-on-OOM" guarantee.
-
+	// memory.oom_group = 1: kill the entire cgroup on OOM, not just one process.
+	// Best-effort — older kernels or restrictive SELinux policies may deny this.
 	if err := write(cgPath, "memory.oom_group", "1"); err != nil {
-		fmt.Printf("[cgroup] Warning: Failed to set memory.oom_group: %v. Container will run with default OOM behavior.\n", err)
+		fmt.Printf("[cgroup] warning: memory.oom_group not set: %v\n", err)
 	}
 
-	// TODO 4: cgroup.procs
-	// Attach the process to the cgroup. This moves the PID into the group.
+	// cgroup.procs: move the container process into this cgroup.
+	// All future child processes it spawns inherit this cgroup automatically.
 	if err := write(cgPath, "cgroup.procs", fmt.Sprintf("%d", pid)); err != nil {
-		return fmt.Errorf("Add process to cgroup: %w", err)
+		return fmt.Errorf("attach process: %w", err)
 	}
 
 	return nil
 }
 
-//cleanUp
-
+// Remove deletes the cgroup directory after the container exits.
+// Must be called after cmd.Wait() — the kernel refuses to remove a cgroup
+// that still has live processes attached.
 func (c *CgroupConfig) Remove() error {
-	path := c.path() //Fixed variable name
-
-	// 1. Check if the cgroup directory exists
-	if _,err := os.Stat(path); os.IsNotExist(err) {
+	path := c.path()
+	if _, err := os.Stat(path); os.IsNotExist(err) {
 		return nil
 	}
 
-
-
-	// 2. Safety Net: Check for remaining processes
-	// If the container crashed, processes might still be here.
-	// os.RemoveAll will fail if processes are present, so we warn the user.
-	procsFile := filepath.Join(path, "cgroup.procs")
-	data, err := os.ReadFile(procsFile)
-	if err == nil {
-		pids := strings.TrimSpace(string(data))
-		if pids != "" {
-			fmt.Printf("[cgroup] Warning: Processes still in cgroup %s: %s\n", c.ID, pids)
-			// In a production runtime, you would iterate these PIDs and kill them here.
+	// Safety check — warn if stray processes are still attached (shouldn't happen after Wait).
+	if data, err := os.ReadFile(filepath.Join(path, "cgroup.procs")); err == nil {
+		if pids := strings.TrimSpace(string(data)); pids != "" {
+			fmt.Printf("[cgroup] warning: processes still in cgroup %s: %s\n", c.ID, pids)
 		}
 	}
 
-	// Use RemoveAll because cgroup directories contain virtual files 
-	// (like memory.max, cpu.stat) that must be cleaned up.
-	// Note: This will fail if processes are still attached. 
-	// Ensure you call this AFTER cmd.Wait() in container.go.
+	// os.RemoveAll required — cgroup dirs contain kernel virtual files that must
+	// be cleaned up as a group; os.Remove would fail on a non-empty directory.
 	if err := os.RemoveAll(path); err != nil {
-		return fmt.Errorf("remove cgroup %s: %w", path, err)
+		return fmt.Errorf("remove cgroup %s: %w", c.ID, err)
 	}
 	return nil
 }
 
-// func (c *CgroupConfig) Remove() error {
-// 	paht := c.path()
-// 	// Check if exists first to avoid unecessary errors
-// 	if _, err := os.Stat(path); os.IsNotExist(err) {
-// 		return nil
-// 	}
-// 	return os.Remove(c.path()) // os.Remove only removes empty directories. If the cgroup still has processes or sub-cgroups, this will fail.
-// 	return os.RemoveAll(path) // RemoveAll is safer, but will fail if processes are still inside.
-// }
-
-// write helper to write string values to cgroup files
-
-func write(path, file, value string) error {
-	return os.WriteFile(
-		filepath.Join(path, file),
-		[]byte(value),
-		0644,
-	)
+// write writes value to a single cgroup control file.
+func write(cgPath, file, value string) error {
+	return os.WriteFile(filepath.Join(cgPath, file), []byte(value), 0644)
 }
 
-// enableControllers delegates controllers from parent to child
-
+// enableControllers writes "+controller" entries to the parent's
+// cgroup.subtree_control file, activating those controllers for child cgroups.
+// Already-enabled controllers are skipped to avoid redundant writes.
 func enableControllers(parentPath string, controllers ...string) error {
-	subtreeControlpath := filepath.Join(parentPath, "cgroup.subtree_control")
-
-	curent, err := os.ReadFile(subtreeControlpath)
+	subtreePath := filepath.Join(parentPath, "cgroup.subtree_control")
+	current, err := os.ReadFile(subtreePath)
 	if err != nil {
 		return err
 	}
 
-	curentStr := string(curent)
+	currentStr := string(current)
 	var toEnable []string
-
 	for _, ctrl := range controllers {
-		// Check if already enabled to avoid writing duplicates
-		if !strings.Contains(curentStr, "+"+ctrl){
+		if !strings.Contains(currentStr, ctrl) {
 			toEnable = append(toEnable, "+"+ctrl)
 		}
 	}
-
 	if len(toEnable) == 0 {
 		return nil
 	}
 
-	if err :=  os.WriteFile(subtreeControlpath, []byte(strings.Join(toEnable, " ")), 0644); err != nil {
-		return fmt.Errorf("Write subtree_control: %w", err)
-	}
-
-	return nil
+	return os.WriteFile(subtreePath, []byte(strings.Join(toEnable, " ")), 0644)
 }
-
