@@ -201,3 +201,113 @@ func CleanupVeth(containerPID int) error {
 func GetContainerIP() string {
 	return ContainerIP
 }
+
+// SetupPortForward adds iptables rules to forward hostPort → containerIP:containerPort.
+// containerIP may include CIDR notation (e.g. "10.88.0.2/16"); the prefix is stripped.
+func SetupPortForward(hostPort, containerPort, containerIP string) error {
+	// Strip CIDR suffix — iptables DNAT destination needs bare IP.
+	ip := strings.SplitN(containerIP, "/", 2)[0]
+
+	// route_localnet=1 allows the kernel to route packets that originated on lo
+	// (127.0.0.1) to non-loopback interfaces after OUTPUT DNAT rewrites the destination.
+	// Without this, curl localhost:hostPort would be silently dropped by the kernel.
+	_ = os.WriteFile("/proc/sys/net/ipv4/conf/all/route_localnet", []byte("1"), 0644)
+
+	// PREROUTING DNAT: rewrite destination IP+port for incoming packets.
+	preArgs := []string{"-t", "nat", "-A", "PREROUTING",
+		"-p", "tcp", "--dport", hostPort,
+		"-j", "DNAT", "--to-destination", ip + ":" + containerPort}
+	preCheck := exec.Command("iptables", append([]string{"-t", "nat", "-C", "PREROUTING",
+		"-p", "tcp", "--dport", hostPort,
+		"-j", "DNAT", "--to-destination", ip + ":" + containerPort})...)
+	if err := preCheck.Run(); err != nil {
+		if out, err := exec.Command("iptables", preArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("iptables DNAT %s->%s:%s: %w, output: %s", hostPort, ip, containerPort, err, string(out))
+		}
+	}
+
+	// OUTPUT DNAT: rewrite destination for packets originating on the host itself.
+	// PREROUTING only handles traffic entering from outside; localhost curl/wget
+	// goes through OUTPUT and would miss the DNAT without this rule.
+	outArgs := []string{"-t", "nat", "-A", "OUTPUT",
+		"-p", "tcp", "--dport", hostPort,
+		"-j", "DNAT", "--to-destination", ip + ":" + containerPort}
+	outCheck := exec.Command("iptables", "-t", "nat", "-C", "OUTPUT",
+		"-p", "tcp", "--dport", hostPort,
+		"-j", "DNAT", "--to-destination", ip+":"+containerPort)
+	if err := outCheck.Run(); err != nil {
+		if out, err := exec.Command("iptables", outArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("iptables OUTPUT DNAT %s->%s:%s: %w, output: %s", hostPort, ip, containerPort, err, string(out))
+		}
+	}
+
+	// MASQUERADE on veil0: when the host sends a port-forwarded packet to the container,
+	// the source is 127.0.0.1. Inside the container, 127.0.0.1 resolves to the container's
+	// own loopback — replies would go to the wrong lo and never return to the host.
+	// Masquerading replaces src=127.0.0.1 with src=10.88.0.1 (bridge IP) so the container
+	// routes replies correctly via its default gateway.
+	masqCheck := exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING",
+		"-o", BridgeName, "-j", "MASQUERADE")
+	if err := masqCheck.Run(); err != nil {
+		if out, err := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING",
+			"-o", BridgeName, "-j", "MASQUERADE").CombinedOutput(); err != nil {
+			return fmt.Errorf("iptables MASQUERADE on %s: %w, output: %s", BridgeName, err, string(out))
+		}
+	}
+
+	// FORWARD ACCEPT: allow forwarded packets destined for the container.
+	fwdArgs := []string{"-A", "FORWARD",
+		"-p", "tcp", "-d", ip, "--dport", containerPort, "-j", "ACCEPT"}
+	fwdCheck := exec.Command("iptables", "-C", "FORWARD",
+		"-p", "tcp", "-d", ip, "--dport", containerPort, "-j", "ACCEPT")
+	if err := fwdCheck.Run(); err != nil {
+		if out, err := exec.Command("iptables", fwdArgs...).CombinedOutput(); err != nil {
+			return fmt.Errorf("iptables FORWARD %s:%s: %w, output: %s", ip, containerPort, err, string(out))
+		}
+	}
+
+	fmt.Printf("[network] port forward: host:%s → %s:%s\n", hostPort, ip, containerPort)
+	return nil
+}
+
+// CleanupPortForward removes the iptables rules added by SetupPortForward.
+func CleanupPortForward(hostPort, containerPort, containerIP string) error {
+	ip := strings.SplitN(containerIP, "/", 2)[0]
+
+	preCheck := exec.Command("iptables", "-t", "nat", "-C", "PREROUTING",
+		"-p", "tcp", "--dport", hostPort,
+		"-j", "DNAT", "--to-destination", ip+":"+containerPort)
+	if err := preCheck.Run(); err == nil {
+		del := exec.Command("iptables", "-t", "nat", "-D", "PREROUTING",
+			"-p", "tcp", "--dport", hostPort,
+			"-j", "DNAT", "--to-destination", ip+":"+containerPort)
+		if out, err := del.CombinedOutput(); err != nil {
+			return fmt.Errorf("remove DNAT rule: %w, output: %s", err, string(out))
+		}
+	}
+
+	outCheck := exec.Command("iptables", "-t", "nat", "-C", "OUTPUT",
+		"-p", "tcp", "--dport", hostPort,
+		"-j", "DNAT", "--to-destination", ip+":"+containerPort)
+	if err := outCheck.Run(); err == nil {
+		del := exec.Command("iptables", "-t", "nat", "-D", "OUTPUT",
+			"-p", "tcp", "--dport", hostPort,
+			"-j", "DNAT", "--to-destination", ip+":"+containerPort)
+		if out, err := del.CombinedOutput(); err != nil {
+			return fmt.Errorf("remove OUTPUT DNAT rule: %w, output: %s", err, string(out))
+		}
+	}
+
+	fwdCheck := exec.Command("iptables", "-C", "FORWARD",
+		"-p", "tcp", "-d", ip, "--dport", containerPort, "-j", "ACCEPT")
+	if err := fwdCheck.Run(); err == nil {
+		del := exec.Command("iptables", "-D", "FORWARD",
+			"-p", "tcp", "-d", ip, "--dport", containerPort, "-j", "ACCEPT")
+		if out, err := del.CombinedOutput(); err != nil {
+			return fmt.Errorf("remove FORWARD rule: %w, output: %s", err, string(out))
+		}
+	}
+
+	fmt.Printf("[network] removed port forward: host:%s → %s:%s\n", hostPort, ip, containerPort)
+	return nil
+}

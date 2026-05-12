@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 
 	"github.com/google/uuid"
@@ -27,10 +28,13 @@ import (
 // ResourceConfig carries runtime constraints passed in from the CLI.
 // Zero values mean "no limit" for numeric fields.
 type ResourceConfig struct {
-	MemoryMax int64 // Hard RSS limit in bytes (0 = unlimited)
-	CPUQuota  int64 // CPU time per period in microseconds (0 = unlimited)
-	CPUPeriod int64 // Scheduling window in microseconds (default 100ms = 100000)
-	Network   bool  // true = isolated netns + veth pair; false = share host network (--no-net)
+	MemoryMax int64    // Hard RSS limit in bytes (0 = unlimited)
+	CPUQuota  int64    // CPU time per period in microseconds (0 = unlimited)
+	CPUPeriod int64    // Scheduling window in microseconds (default 100ms = 100000)
+	Network   bool     // true = isolated netns + veth pair; false = share host network (--no-net)
+	Env       []string // Extra environment variables (KEY=VALUE) injected into the container
+	Volumes   []string // bind mounts in host:container format
+	Ports     []string // Port mappings "hostPort:containerPort"; requires Network=true
 }
 
 // Run is the top-level entry point for container execution.
@@ -101,10 +105,14 @@ func Run(image string, command []string, resources *ResourceConfig) {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = []string{
+	baseEnv := []string{
 		"VEIL_CHILD=1",
 		fmt.Sprintf("VEIL_ROOTFS=%s", mergedDir),
 	}
+	if len(resources.Volumes) > 0 {
+		baseEnv = append(baseEnv, fmt.Sprintf("VEIL_VOLUMES=%s", strings.Join(resources.Volumes, ",")))
+	}
+	cmd.Env = append(baseEnv, resources.Env...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: cloneFlags}
 
 	// Step 6: Start() clones the namespaces and forks the child process.
@@ -153,9 +161,20 @@ func Run(image string, command []string, resources *ResourceConfig) {
 	// Step 9: attach the veth pair while the process is still frozen.
 	// We need the PID to name the host-side veth and to enter the container's
 	// netns via nsenter (/proc/<pid>/ns/net).
+	containerIP := network.GetContainerIP()
 	if resources.Network {
-		if err := network.SetupVeth(pid, network.GetContainerIP()); err != nil {
+		if err := network.SetupVeth(pid, containerIP); err != nil {
 			fmt.Printf("[container] veth warning: %v (continuing without networking)\n", err)
+		}
+		for _, p := range resources.Ports {
+			parts := strings.SplitN(p, ":", 2)
+			if len(parts) != 2 {
+				fmt.Fprintf(os.Stderr, "[container] invalid port mapping %q (want host:container)\n", p)
+				continue
+			}
+			if err := network.SetupPortForward(parts[0], parts[1], containerIP); err != nil {
+				fmt.Printf("[container] port forward warning: %v\n", err)
+			}
 		}
 	}
 
@@ -177,6 +196,14 @@ func Run(image string, command []string, resources *ResourceConfig) {
 		fmt.Printf("[container] cgroup cleanup: %v\n", err)
 	}
 	if resources.Network {
+		for _, p := range resources.Ports {
+			parts := strings.SplitN(p, ":", 2)
+			if len(parts) == 2 {
+				if err := network.CleanupPortForward(parts[0], parts[1], containerIP); err != nil {
+					fmt.Printf("[container] port forward cleanup: %v\n", err)
+				}
+			}
+		}
 		// Deleting the host-side veth automatically removes the container side too.
 		if err := network.CleanupVeth(pid); err != nil {
 			fmt.Printf("[container] veth cleanup: %v\n", err)
