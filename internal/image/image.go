@@ -33,12 +33,17 @@ func Pull(imageRef string) (string, error) {
 		return "", fmt.Errorf("mkdir image dir: %w", err)
 	}
 
-	// Check cache
+	// Check cache — validate sentinel file, not just directory existence.
+	// An empty rootfs dir left by a failed prior pull would fool os.Stat.
 	rootfsPath := filepath.Join(imageDir, "rootfs")
-	if _, err := os.Stat(rootfsPath); err == nil {
+	sentinelPath := filepath.Join(imageDir, ".pulled")
+	if _, err := os.Stat(sentinelPath); err == nil {
 		fmt.Printf("[image] Using cached: %s\n", imageRef)
 		return rootfsPath, nil
 	}
+
+	// Remove stale rootfs from any prior partial extraction before retrying.
+	_ = os.RemoveAll(rootfsPath)
 
 	fmt.Printf("[image] Pulling %s...\n", imageRef)
 
@@ -51,6 +56,11 @@ func Pull(imageRef string) (string, error) {
 	// Extract all layers to rootfs
 	if err := extractLayers(img, rootfsPath); err != nil {
 		return "", fmt.Errorf("extract layers: %w", err)
+	}
+
+	// Write sentinel only after successful extraction — future pulls use cache safely.
+	if err := os.WriteFile(sentinelPath, []byte("ok"), 0644); err != nil {
+		return "", fmt.Errorf("write sentinel: %w", err)
 	}
 
 	fmt.Printf("[image] Pulled: %s → %s\n", imageRef, rootfsPath)
@@ -95,9 +105,13 @@ func extractTar(r io.Reader, dest string) error {
 			return err
 		}
 
-		// Security: Prevent path traversal attacks
+		// Security: Prevent path traversal attacks using filepath.Rel.
+		// The old HasPrefix check rejected valid root-level entries on some
+		// tar implementations where dest and target could share a prefix
+		// without a separator boundary.
 		target := filepath.Join(dest, header.Name)
-		if !strings.HasPrefix(target, dest+string(os.PathSeparator)) && target != dest {
+		rel, err := filepath.Rel(dest, target)
+		if err != nil || strings.HasPrefix(rel, "..") {
 			return fmt.Errorf("illegal path: %s", header.Name)
 		}
 
@@ -130,6 +144,23 @@ func extractTar(r io.Reader, dest string) error {
 				return err
 			}
 			f.Close()
+		case tar.TypeLink:
+			// Hard link — alpine uses these extensively for busybox multi-call binary.
+			// Both link and target must stay within dest to prevent host filesystem escapes.
+			linkTarget := filepath.Join(dest, header.Linkname)
+			linkRel, err := filepath.Rel(dest, linkTarget)
+			if err != nil || strings.HasPrefix(linkRel, "..") {
+				return fmt.Errorf("illegal hard link target: %s", header.Linkname)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			// Remove stale entry before linking (layer override semantics).
+			_ = os.Remove(target)
+			if err := os.Link(linkTarget, target); err != nil {
+				return fmt.Errorf("hardlink %s -> %s: %w", header.Name, header.Linkname, err)
+			}
+
 		case tar.TypeSymlink:
 			// Absolute symlinks (e.g. /bin/busybox) resolve inside the container's
 			// rootfs after pivot_root — not on the host. Always safe to allow.
