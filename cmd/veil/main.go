@@ -69,8 +69,11 @@ var (
 	// Flags for the run command — zero means "no limit applied".
 	memoryLimit int64
 	cpuQuota    int64
-	cpuPeriod   int64 = 100000 // default 100ms period
-	disableNet  bool           // --no-net: skip veth/bridge setup, share host network stack
+	cpuPeriod   int64    = 100000 // default 100ms period
+	disableNet  bool               // --no-net: skip veth/bridge setup, share host network stack
+	envVars     []string           // -e KEY=VALUE environment variables
+	ports       []string           // -p host:container port mappings
+	volumes     []string           // -v host:container bind mounts
 )
 
 func init() {
@@ -83,6 +86,9 @@ func init() {
 	runCmd.Flags().Int64Var(&cpuPeriod, "cpu-period", 100000, "CPU period in microseconds")
 	// Networking flag: default ON (isolated veth), --no-net reverts to host network.
 	runCmd.Flags().BoolVar(&disableNet, "no-net", false, "Disable container networking (share host network stack)")
+	runCmd.Flags().StringArrayVarP(&envVars, "env", "e", nil, "Set environment variable (KEY=VALUE)")
+	runCmd.Flags().StringArrayVarP(&ports, "publish", "p", nil, "Publish port (host:container)")
+	runCmd.Flags().StringArrayVarP(&volumes, "volume", "v", nil, "Bind mount volume (host:container)")
 }
 
 // runContainer builds a ResourceConfig from flags and delegates to container.Run().
@@ -97,6 +103,9 @@ func runContainer(cmd *cobra.Command, args []string) {
 		CPUPeriod: cpuPeriod,
 		// Network is enabled by default — pass --no-net to share host network stack.
 		Network: !disableNet,
+		Env:     envVars,
+		Ports:   ports,
+		Volumes: volumes,
 	}
 
 	container.Run(imageRef, command, resources)

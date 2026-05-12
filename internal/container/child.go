@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/i-OmSharma/veil/internal/overlayfs"
@@ -74,6 +75,47 @@ func Child() {
 		}
 	}
 
+	// Bind-mount user volumes (VEIL_VOLUMES=host:cont,host:cont) before pivot_root.
+	// After pivot_root host paths are unreachable, so mounts must happen now.
+	if vols := os.Getenv("VEIL_VOLUMES"); vols != "" {
+		for _, vol := range strings.Split(vols, ",") {
+			parts := strings.SplitN(vol, ":", 2)
+			if len(parts) != 2 {
+				fmt.Fprintf(os.Stderr, "[init] invalid volume %q (want host:container)\n", vol)
+				continue
+			}
+			hostPath, containerPath := parts[0], parts[1]
+			target := filepath.Join(rootfs, containerPath)
+			hostInfo, err := os.Stat(hostPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[init] volume stat %s: %v\n", hostPath, err)
+				os.Exit(1)
+			}
+			if hostInfo.IsDir() {
+				if err := os.MkdirAll(target, 0755); err != nil {
+					fmt.Fprintf(os.Stderr, "[init] volume mkdir %s: %v\n", target, err)
+					os.Exit(1)
+				}
+			} else {
+				if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+					fmt.Fprintf(os.Stderr, "[init] volume mkdir parent %s: %v\n", filepath.Dir(target), err)
+					os.Exit(1)
+				}
+				f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY, 0644)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "[init] volume touch %s: %v\n", target, err)
+					os.Exit(1)
+				}
+				f.Close()
+			}
+			if err := syscall.Mount(hostPath, target, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+				fmt.Fprintf(os.Stderr, "[init] volume bind %s→%s: %v\n", hostPath, containerPath, err)
+				os.Exit(1)
+			}
+			fmt.Printf("[init] volume mounted %s → %s\n", hostPath, containerPath)
+		}
+	}
+
 	// pivot_root: swap the container rootfs for the host's /.
 	// This must happen BEFORE mounting /proc — the new /proc belongs on the new root.
 	if err := overlayfs.PivotRoot(rootfs); err != nil {
@@ -102,12 +144,18 @@ func Child() {
 		os.Exit(1)
 	}
 
-	// Minimal, explicit environment — never inherit host variables.
+	// Base env: well-known defaults. User-supplied vars (passed via cmd.Env in run.go,
+	// filtered here) are appended after — they can override these if needed.
 	env := []string{
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"HOME=/root",
 		"TERM=xterm",
 		fmt.Sprintf("HOSTNAME=%s", hostname),
+	}
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "VEIL_") {
+			env = append(env, kv)
+		}
 	}
 
 	fmt.Println("[init] exec:", command)
