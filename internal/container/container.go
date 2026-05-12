@@ -7,7 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+
 	"github.com/i-OmSharma/veil/internal/cgroup"
+	img "github.com/i-OmSharma/veil/internal/image"     // Aliased to 'img' to prevent shadowing the 'image' variable in Run()
+	"github.com/i-OmSharma/veil/internal/overlayfs" // Added OverlayFS handling
 )
 
 // ResourceConfig holds dynamic resource limits
@@ -30,62 +33,62 @@ func Run(image string, command []string, resources *ResourceConfig) {
 		os.Exit(1)
 	}
 
-	// Create Command
-	// cmd := exec.Command(command[0], command[1:]...) //runs directly(/bin/sh) child was never called
+	// Resolve/Pull image to get rootfs path
+	// Using the imported 'img' package to resolve the image name into a local root filesystem path
+	rootfs, err := img.Resolve(image)
+	if err != nil {
+		fmt.Printf("[container] image error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("[container] Using rootfs: %s\n", rootfs)
 
-	//We re-exec the same binary with "child" argument to enter the namespace
-	cmd := exec.Command("/proc/self/exe", append([]string{"child", image}, command...)...) //same binary run again(/proc/self/exe) -> veil child /bin/sh
+	// Mount overlay BEFORE starting child — env must be fully set before Start()
+	// Use parent PID as container ID (unique per invocation, known before child starts)
+	containerID := fmt.Sprintf("%d", os.Getpid())
+	ovl := overlayfs.New(containerID, rootfs)
+	mergedDir, err := ovl.Mount()
+	if err != nil {
+		fmt.Printf("[container] overlay mount error: %v\n", err)
+		os.Exit(1)
+	}
 
-	// Attach Terminal
+	cmd := exec.Command("/proc/self/exe", append([]string{"child", image}, command...)...)
+
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), "VEIL_CHILD=1") // mark as child (to avoid duplicate logs) in the child() function
-
-	//NameSpcace isolation
-	// Cloneflags = used to run process in a isolated world.
+	cmd.Env = []string{
+		"VEIL_CHILD=1",
+		fmt.Sprintf("VEIL_ROOTFS=%s", mergedDir),
+	}
 
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: syscall.CLONE_NEWPID |
 			syscall.CLONE_NEWUTS |
 			syscall.CLONE_NEWNS |
 			syscall.CLONE_NEWIPC,
-		/////////////////////////////
-		// syscall.CLONE_NEWCGROUP |
-		// syscall.CLONE_NEWNET |
-		// syscall.CLONE_NEWUSER |
-		// syscall.CLONE_NEWTIME,
 	}
 
-	// 1. Start the rpocess(Npn-Blocking)
-	// We use Start() instead of Run() so we can interact with the PID before it fully runs
 	if err := cmd.Start(); err != nil {
-		fmt.Printf("[container] strat error: %v\n", err)
-		os.Exit(1)
-	} 
-
-	/*
-	// Run process
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("[container]Error : %v\n", err)
+		fmt.Printf("[container] start error: %v\n", err)
+		ovl.Unmount()
 		os.Exit(1)
 	}
-		*/   //this run was previously used, it was blocking
-		
-	// 2. Pause Process Immediately (safety Critical)
-	// We freeze the process so it doesn't consume resources before limits are applied
-	if err:=  cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+
+	// Freeze child immediately — apply cgroup before any execution
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
 		fmt.Printf("[container] failed to stop process: %v\n", err)
 		cmd.Process.Kill()
+		ovl.Unmount()
 		os.Exit(1)
 	}
 
 	// 3. Apply Dynamic Cgroup WHILE Paused
 	pid := cmd.Process.Pid
 	cgConfig := &cgroup.CgroupConfig{
-		ID: fmt.Sprintf("veil-%d", pid),
+		ID:        fmt.Sprintf("veil-%d", pid),
 		MemoryMax: resources.MemoryMax, // DYNAMIC VALUE
-		CPUQuota: resources.CPUQuota, // DYNAMIC VALUE
+		CPUQuota:  resources.CPUQuota,  // DYNAMIC VALUE
 		CPUPeriod: resources.CPUPeriod, // DYNAMIC VALUE
 	}
 
@@ -94,6 +97,8 @@ func Run(image string, command []string, resources *ResourceConfig) {
 	if cgConfig.MemoryMax > 0 || cgConfig.CPUQuota > 0 {
 		if err := cgConfig.Apply(pid); err != nil {
 			fmt.Printf("[container] cgroup apply error: %v\n", err)
+			// Cleanup overlay on error to prevent resource leaks before killing process
+			ovl.Unmount()
 			cmd.Process.Kill()
 			os.Exit(1)
 		}
@@ -106,25 +111,26 @@ func Run(image string, command []string, resources *ResourceConfig) {
 		fmt.Printf("[container] failed to continue process: %v\n", err)
 		cmd.Process.Kill()
 		os.Exit(1)
-	} 
+	}
 
-	// 5. Wait for Completion
+	// 5. Wait for Completion to exit
 	if err := cmd.Wait(); err != nil {
 		fmt.Printf("[container] exit error: %v\n", err)
 	}
 
-	// 6. Cleanup Cgroups
+	// 6. Cleanup Cgroups + OverlayFS
 	if err := cgConfig.Remove(); err != nil {
 		fmt.Printf("[container] cleanup warning: %v\n", err)
-	} else {
-		fmt.Println("[container] Cgroups cleaned up")
 	}
 	
+	// Unmount and clean up the overlay filesystem when container finishes
+	if err := ovl.Unmount(); err != nil {
+		fmt.Printf("[container] overlay cleanup warning: %v\n", err)
+	}
+
 	fmt.Println("[container] Finished")
 }
 //
-
-
 
 func Child() {
 
@@ -133,6 +139,13 @@ func Child() {
 	// validate args
 	if len(os.Args) < 4 {
 		fmt.Fprintln(os.Stderr, "[init] Invalid child invocation")
+		os.Exit(1)
+	}
+
+	// Get rootfs from environment
+	rootfs := os.Getenv("VEIL_ROOTFS")
+	if rootfs == "" {
+		fmt.Fprintln(os.Stderr, "[init] VEIL_ROOTFS not set")
 		os.Exit(1)
 	}
 
@@ -152,6 +165,14 @@ func Child() {
 	}
 	fmt.Println("[init] Hostname set to:", hostName)
 
+	// Pivot to container rootfs
+	// This physically swaps the root filesystem and MUST happen BEFORE mounting /proc
+	if err := overlayfs.PivotRoot(rootfs); err != nil {
+		fmt.Fprintf(os.Stderr, "[init] pivot_root error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("[init] Pivoted to rootfs")
+
 	// ensure/ proc exists
 
 	if err := os.MkdirAll("/proc", 0755); err != nil {
@@ -168,15 +189,14 @@ func Child() {
 		fmt.Println("Unmount error: ", err)
 	}*/
 
-
 	//EBUSY usually means it is already mounted
-		// if errno, ok := err.(syscall.Errno); ok && errno == syscall.EBUSY {
-		// 	fmt.Println("/proc is already mounted")
-		// } else {
+	// if errno, ok := err.(syscall.Errno); ok && errno == syscall.EBUSY {
+	//  fmt.Println("/proc is already mounted")
+	// } else {
 
 	if err := syscall.Mount("proc", "/proc", "proc", syscall.MS_NOEXEC|syscall.MS_NOSUID|syscall.MS_NODEV, ""); err != nil {
 		fmt.Printf("[init] mount error:  %v\n", err)
-		os.Exit(1)	
+		os.Exit(1)
 	}
 	fmt.Println("[init] Mounted /proc")
 
@@ -190,8 +210,8 @@ func Child() {
 
 	// first validate args
 	if len(os.Args) < 4 {
-	fmt.Fprintln(os.Stderr, "[init] Invalid child invocation")
-	os.Exit(1)
+		fmt.Fprintln(os.Stderr, "[init] Invalid child invocation")
+		os.Exit(1)
 	}
 
 	// Slice
@@ -209,7 +229,8 @@ func Child() {
 		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 		"HOME=/root",
 		"TERM=xterm",
-		"HOSTNAME=veil-container",
+		// Dynamically assign the container's PID-based hostname to the environment
+		fmt.Sprintf("HOSTNAME=%s", hostName),
 	}
 
 	if err := syscall.Exec(command[0], command, env); err != nil {
@@ -217,7 +238,6 @@ func Child() {
 		os.Exit(1)
 	}
 }
-
 
 /*
 Run()
