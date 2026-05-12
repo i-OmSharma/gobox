@@ -1,4 +1,5 @@
-# Go build artifacts
+# ── Build output ─────────────────────────────────────────────────────────────
+/veil
 bin/
 dist/
 *.exe
@@ -9,18 +10,42 @@ dist/
 *.test
 *.out
 
-# Coverage and profiling output
+# ── Go toolchain ──────────────────────────────────────────────────────────────
+/vendor/
+*.mod.bak
+
+# ── Container runtime artifacts ───────────────────────────────────────────────
+# State file written to /var/lib/veil/ at runtime — not part of source
+/var/lib/veil/
+# Overlay work/upper/merged dirs created per container
+overlayfs/*/
+# Unpacked image layers and rootfs trees
+layers/
+images/
+*.rootfs/
+*.layer.tar
+
+# ── Test & profiling ──────────────────────────────────────────────────────────
 coverage.out
 *.coverprofile
 *.prof
 
-# IDE/editor settings
+# ── IDE / editor ──────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# Local tool settings
+# ── Local tool settings ───────────────────────────────────────────────────────
 .claude/
 
-# OS files
+# ── Secrets & environment ─────────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
