@@ -122,12 +122,21 @@ func Stop(id string) error {
 	if err != nil {
 		return err
 	}
-	// Graceful stop: SIGTERM, then SIGKILL after 5s
+	// Graceful stop: SIGTERM, then poll for up to 5s, then SIGKILL.
 	if err := proc.Signal(syscall.SIGTERM); err != nil {
 		return err
 	}
-	// Note: In real impl, you'd wait here or use a goroutine
-	// For simplicity, we just send the signal
+	for i := 0; i < 10; i++ {
+		time.Sleep(500 * time.Millisecond)
+		if err := proc.Signal(syscall.Signal(0)); err != nil {
+			// Process has exited cleanly.
+			c.Status = "exited"
+			return s.Save()
+		}
+	}
+	// Still alive after 5s — force kill.
+	_ = proc.Signal(syscall.SIGKILL)
+	c.Status = "exited"
 	return s.Save()
 }
 

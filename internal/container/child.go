@@ -124,6 +124,15 @@ func Child() {
 	}
 	fmt.Println("[init] pivoted to rootfs")
 
+	// Write /etc/resolv.conf so the container can resolve hostnames.
+	// Non-fatal — a missing resolv.conf is annoying but not a hard failure.
+	const resolvConf = "nameserver 8.8.8.8\nnameserver 1.1.1.1\n"
+	if err := os.MkdirAll("/etc", 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "[init] mkdir /etc: %v (DNS unavailable)\n", err)
+	} else if err := os.WriteFile("/etc/resolv.conf", []byte(resolvConf), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "[init] write /etc/resolv.conf: %v (DNS unavailable)\n", err)
+	}
+
 	// Mount a fresh /proc for this PID namespace.
 	// MS_NOEXEC, MS_NOSUID, MS_NODEV are standard hardening flags for /proc.
 	if err := os.MkdirAll("/proc", 0755); err != nil {
