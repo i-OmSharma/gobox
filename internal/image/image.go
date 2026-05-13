@@ -96,6 +96,13 @@ func extractTar(r io.Reader, dest string) error {
 	tr := tar.NewReader(r)
 	dest = filepath.Clean(dest)
 
+	// Ensure dest exists before any entry is processed. Symlink and regular-file
+	// entries that appear before the root TypeDir entry would otherwise fail with
+	// ENOENT because their parent MkdirAll calls stop short of creating dest itself.
+	if err := os.MkdirAll(dest, 0755); err != nil {
+		return err
+	}
+
 	for {
 		header, err := tr.Next()
 		if err == io.EOF {
@@ -171,6 +178,9 @@ func extractTar(r io.Reader, dest string) error {
 				if !strings.HasPrefix(resolved, dest+string(os.PathSeparator)) && resolved != dest {
 					return fmt.Errorf("illegal relative symlink: %s -> %s", header.Name, header.Linkname)
 				}
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
 			}
 			if err := os.Symlink(header.Linkname, target); err != nil && !os.IsExist(err) {
 				return err
