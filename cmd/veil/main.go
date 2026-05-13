@@ -80,6 +80,8 @@ func init() {
 	// Wire subcommands into the root command.
 	rootCmd.AddCommand(runCmd, pullCmd, pushCmd, psCmd, stopCmd, imagesCmd)
 
+	runCmd.Flags().SetInterspersed(false)
+
 	// Resource limit flags for "veil run".
 	runCmd.Flags().Int64VarP(&memoryLimit, "memory", "m", 0, "Memory limit in bytes")
 	runCmd.Flags().Int64Var(&cpuQuota, "cpu-quota", 0, "CPU quota in microseconds")
