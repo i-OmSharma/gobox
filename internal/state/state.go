@@ -140,6 +140,29 @@ func Stop(id string) error {
 	return s.Save()
 }
 
+// Prune removes all exited containers from state. Returns count removed.
+func Prune() (int, error) {
+	s, err := Load()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for id, c := range s.Containers {
+		if c.Status == "running" {
+			if proc, err := os.FindProcess(c.PID); err == nil {
+				if err := proc.Signal(syscall.Signal(0)); err != nil {
+					c.Status = "exited"
+				}
+			}
+		}
+		if c.Status == "exited" {
+			delete(s.Containers, id)
+			count++
+		}
+	}
+	return count, s.Save()
+}
+
 // Helper to create a new container record
 func NewContainer(id, image, rootfs string, command []string, pid int) *Container {
 	return &Container{

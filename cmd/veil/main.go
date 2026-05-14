@@ -66,6 +66,13 @@ var (
 		Run:   listImages,
 	}
 
+	// pruneCmd removes all exited containers from state.
+	pruneCmd = &cobra.Command{
+		Use:   "prune",
+		Short: "Remove all exited containers",
+		Run:   pruneContainers,
+	}
+
 	// Flags for the run command — zero means "no limit applied".
 	memoryLimit int64
 	cpuQuota    int64
@@ -78,7 +85,7 @@ var (
 
 func init() {
 	// Wire subcommands into the root command.
-	rootCmd.AddCommand(runCmd, pullCmd, pushCmd, psCmd, stopCmd, imagesCmd)
+	rootCmd.AddCommand(runCmd, pullCmd, pushCmd, psCmd, stopCmd, imagesCmd, pruneCmd)
 
 	runCmd.Flags().SetInterspersed(false)
 
@@ -157,6 +164,16 @@ func listContainers(cmd *cobra.Command, args []string) {
 		fmt.Printf("%-12s %-20s %-10s %-20s\n",
 			shortID(c.ID), c.Image, c.Status, fmt.Sprintf("%v", c.Command))
 	}
+}
+
+// pruneContainers removes all exited containers from state.
+func pruneContainers(cmd *cobra.Command, args []string) {
+	n, err := state.Prune()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[veil] prune error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("[veil] Removed %d exited container(s)\n", n)
 }
 
 // stopContainer delegates to state.Stop() which sends SIGTERM and updates status.
